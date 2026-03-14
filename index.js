@@ -12,7 +12,7 @@ const API_BASE = 'ydfvfdizipanel.ru';
 
 const MANIFEST = {
   id: 'com.dizipalorijinal.addon',
-  version: '4.0.0',
+  version: '5.0.0',
   name: '🇹🇷 DiziPal Orijinal',
   description: 'Türkçe dublaj diziler — DiziPal Orijinal kaynağından',
   logo: 'https://www.google.com/s2/favicons?domain=dizipal1542.com&sz=128',
@@ -30,21 +30,17 @@ const MANIFEST = {
   behaviorHints: { adult: false, configurable: false },
 };
 
-// ─── HTTP fetch ───────────────────────────────────────────────────────────────
+// ─── Yardımcılar ──────────────────────────────────────────────────────────────
 
 function fetchHtml(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html',
-      },
+      headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36' },
       timeout: 15000,
     }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
         return fetchHtml(res.headers.location).then(resolve).catch(reject);
-      }
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => resolve(data));
@@ -57,8 +53,7 @@ function fetchHtml(url) {
 function apiGet(path) {
   return new Promise((resolve, reject) => {
     const req = https.get({
-      hostname: API_BASE,
-      path,
+      hostname: API_BASE, path,
       headers: { 'Accept': 'application/json', 'Accept-Encoding': 'identity' },
       timeout: 15000,
     }, (res) => {
@@ -74,8 +69,6 @@ function apiGet(path) {
   });
 }
 
-// ─── Mediafire çözücü ────────────────────────────────────────────────────────
-
 async function resolveMediafire(mfUrl) {
   const cacheKey = `mf_${mfUrl}`;
   const cached = cache.get(cacheKey);
@@ -83,45 +76,62 @@ async function resolveMediafire(mfUrl) {
   try {
     const html = await fetchHtml(mfUrl);
     const match = html.match(/href="(https:\/\/download\d+\.mediafire\.com\/[^"]+)"/);
-    if (match) {
-      cache.set(cacheKey, match[1], 1800);
-      return match[1];
-    }
-  } catch (e) {
-    console.error('[Mediafire Hata]', e.message);
-  }
+    if (match) { cache.set(cacheKey, match[1], 1800); return match[1]; }
+  } catch (e) { console.error('[Mediafire Hata]', e.message); }
   return null;
 }
 
-// ─── Katalog: tüm unique dizileri toplu çek ve cache'le ──────────────────────
-// Startup'ta değil, ilk catalog isteğinde başlat
+// ─── Katalog: skip değerine göre doğru API sayfalarını bul ───────────────────
+// Her API sayfasında ortalama 3 unique dizi var (15 bölüm / ~5 bölüm per dizi)
+// skip=0 → p1..p34, skip=100 → p35..p68 gibi (100 dizi = ~34 sayfa)
+// Güvenli yaklaşım: kaç sayfa gerekiyorsa çek, 100 unique dizi topla
 
-let allSeriesCache = null; // { list: [{id, name, poster, genres}], ts: Date }
-let fetchInProgress = false;
+async function getCatalogPage(skip) {
+  const cacheKey = `catalog_skip_${skip}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
 
-async function getAllSeries() {
-  // 1 saatlik cache
-  if (allSeriesCache && (Date.now() - allSeriesCache.ts) < 3600000) {
-    return allSeriesCache.list;
-  }
-  if (fetchInProgress) {
-    // Zaten çekiliyor, bitene kadar bekle
-    await new Promise(r => setTimeout(r, 2000));
-    return allSeriesCache ? allSeriesCache.list : [];
-  }
+  // İlk çağrıda totalPages öğren
+  const firstPage = await apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=1`);
+  const totalPages = firstPage.last_page;
 
-  fetchInProgress = true;
-  console.log('[Katalog] Tüm diziler çekiliyor...');
+  // skip kadar unique dizi atlamak için kaç API sayfası gerekiyor?
+  // Ortalama her 5 API sayfasında ~15 unique dizi var (deneyimsel)
+  // skip=0 → apiStart=1, skip=100 → apiStart ~34
+  const UNIQUE_PER_BATCH = 15; // her 5 sayfada ~15 unique dizi
+  const PAGES_PER_BATCH = 5;
+  const batchIndex = Math.floor(skip / UNIQUE_PER_BATCH);
+  let apiStart = batchIndex * PAGES_PER_BATCH + 1;
 
-  try {
-    const first = await apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=1`);
-    const totalPages = first.last_page;
-    const seriesMap = new Map();
+  const seriesMap = new Map(); // id → meta (dizi başına bir kez)
+  const seenIds = new Set();
 
-    const processPage = (pageData) => {
-      for (const ep of pageData.data) {
-        if (!ep.imdb_external_id || seriesMap.has(ep.id)) continue;
-        seriesMap.set(ep.id, {
+  // skip kadar dizi atla (önceki sayfaları hızlıca geç)
+  // Daha basit: sayfaları sırayla çek, ilk skip unique'i atla, sonraki 100'ü al
+  // Ama bu çok yavaş. Bunun yerine: her skip bloğunu cache'le.
+
+  // En sağlam çözüm: sayfaları sırayla çek (5'er paralel), 
+  // (skip + 100) unique dizi görene kadar devam et, sonra skip'ten itibaren 100 al.
+
+  const TARGET = skip + 100;
+  const allUnique = []; // sıralı unique diziler
+  let apiPage = 1;
+
+  while (allUnique.length < TARGET && apiPage <= totalPages) {
+    // 5 sayfayı paralel çek
+    const batch = [];
+    for (let i = 0; i < 5 && apiPage <= totalPages; i++, apiPage++) {
+      batch.push(apiPage);
+    }
+    const results = await Promise.all(
+      batch.map(p => apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=${p}`).catch(() => null))
+    );
+    for (const r of results) {
+      if (!r || !r.data) continue;
+      for (const ep of r.data) {
+        if (!ep.imdb_external_id || seenIds.has(ep.id)) continue;
+        seenIds.add(ep.id);
+        allUnique.push({
           id: ep.imdb_external_id,
           type: 'series',
           name: ep.name,
@@ -130,32 +140,13 @@ async function getAllSeries() {
           description: '🇹🇷 Türkçe Dublaj',
         });
       }
-    };
-
-    processPage(first);
-
-    // 20'şer paralel çek
-    const BATCH = 20;
-    for (let start = 2; start <= totalPages; start += BATCH) {
-      const end = Math.min(start + BATCH - 1, totalPages);
-      const pages = Array.from({ length: end - start + 1 }, (_, i) => start + i);
-      const results = await Promise.all(pages.map(p =>
-        apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=${p}`).catch(() => null)
-      ));
-      results.forEach(r => { if (r) processPage(r); });
-
-      if (start % 200 === 2) {
-        console.log(`[Katalog] Sayfa ${end}/${totalPages} — ${seriesMap.size} unique dizi`);
-      }
     }
-
-    const list = [...seriesMap.values()];
-    allSeriesCache = { list, ts: Date.now() };
-    console.log(`[Katalog] Tamamlandı: ${list.length} dizi`);
-    return list;
-  } finally {
-    fetchInProgress = false;
+    console.log(`[Catalog] skip=${skip} → ${allUnique.length}/${TARGET} unique dizi (apiPage=${apiPage})`);
   }
+
+  const result = allUnique.slice(skip, skip + 100);
+  cache.set(cacheKey, result, 3600);
+  return result;
 }
 
 // ─── Bölüm bulucular ─────────────────────────────────────────────────────────
@@ -173,9 +164,9 @@ async function findEpisodes(imdbId) {
   for (let start = 2; start <= totalPages; start += BATCH) {
     const end = Math.min(start + BATCH - 1, totalPages);
     const pages = Array.from({ length: end - start + 1 }, (_, i) => start + i);
-    const results = await Promise.all(pages.map(p =>
-      apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=${p}`).catch(() => null)
-    ));
+    const results = await Promise.all(
+      pages.map(p => apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=${p}`).catch(() => null))
+    );
     for (const r of results) {
       if (r && r.data) episodes.push(...r.data.filter(e => e.imdb_external_id === imdbId));
     }
@@ -203,9 +194,9 @@ async function findEpisode(imdbId, season, episode) {
     for (let start = 2; start <= totalPages; start += BATCH) {
       const end = Math.min(start + BATCH - 1, totalPages);
       const pages = Array.from({ length: end - start + 1 }, (_, i) => start + i);
-      const results = await Promise.all(pages.map(p =>
-        apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=${p}`).catch(() => null)
-      ));
+      const results = await Promise.all(
+        pages.map(p => apiGet(`/public/api/media/seriesEpisodesAll/${TOKEN}?page=${p}`).catch(() => null))
+      );
       for (const r of results) {
         if (!r || !r.data) continue;
         found = r.data.find(e =>
@@ -233,7 +224,6 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => res.redirect('/manifest.json'));
 app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
-// Catalog
 app.get([
   '/catalog/series/dizipalorijinal.json',
   '/catalog/series/dizipalorijinal/:extra.json',
@@ -244,25 +234,18 @@ app.get([
       const m = decodeURIComponent(req.params.extra).match(/skip=(\d+)/);
       if (m) skip = parseInt(m[1]);
     }
-
-    const allSeries = await getAllSeries();
-    const PAGE_SIZE = 100;
-    const page = allSeries.slice(skip, skip + PAGE_SIZE);
-
-    console.log(`[Catalog] skip=${skip} → ${page.length} dizi (toplam: ${allSeries.length})`);
-    res.json({ metas: page });
+    const metas = await getCatalogPage(skip);
+    console.log(`[Catalog] skip=${skip} → ${metas.length} dizi döndürüldü`);
+    res.json({ metas });
   } catch (e) {
     console.error('[Catalog Hata]', e.message);
     res.json({ metas: [] });
   }
 });
 
-// Meta
 app.get('/meta/series/:id.json', async (req, res) => {
   try {
     const imdbId = req.params.id;
-    console.log(`[Meta] ${imdbId}`);
-
     const episodes = await findEpisodes(imdbId);
     if (!episodes.length) return res.json({ meta: null });
 
@@ -283,10 +266,8 @@ app.get('/meta/series/:id.json', async (req, res) => {
 
     res.json({
       meta: {
-        id: imdbId,
-        type: 'series',
-        name: ref.name,
-        poster: ref.poster_path,
+        id: imdbId, type: 'series',
+        name: ref.name, poster: ref.poster_path,
         genres: ref.genre_name ? [ref.genre_name] : [],
         description: `🇹🇷 Türkçe Dublaj | ${episodes.length} bölüm`,
         videos,
@@ -298,7 +279,6 @@ app.get('/meta/series/:id.json', async (req, res) => {
   }
 });
 
-// Stream
 app.get('/stream/series/:id.json', async (req, res) => {
   try {
     const parts = req.params.id.split(':');
@@ -307,14 +287,13 @@ app.get('/stream/series/:id.json', async (req, res) => {
     const imdbId = parts[0];
     const season = parseInt(parts[1]);
     const episode = parseInt(parts[2]);
-    console.log(`[Stream] ${imdbId} S${season}E${episode}`);
 
     const ep = await findEpisode(imdbId, season, episode);
     if (!ep || !ep.link) return res.json({ streams: [] });
 
-    const streams = [];
     const title = ep.episode_name || `S${String(season).padStart(2,'0')}E${String(episode).padStart(2,'0')}`;
     const filename = `${ep.name} S${String(season).padStart(2,'0')}E${String(episode).padStart(2,'0')}.mkv`;
+    const streams = [];
 
     if (ep.hls === 1) {
       streams.push({ name: '🇹🇷 DiziPal', title: `📺 ${title}`, url: ep.link });
@@ -322,10 +301,8 @@ app.get('/stream/series/:id.json', async (req, res) => {
       const directUrl = await resolveMediafire(ep.link);
       if (directUrl) {
         streams.push({
-          name: '🇹🇷 DiziPal',
-          title: `🎬 ${title} — Türkçe Dublaj`,
-          url: directUrl,
-          behaviorHints: { notWebReady: false, filename },
+          name: '🇹🇷 DiziPal', title: `🎬 ${title} — Türkçe Dublaj`,
+          url: directUrl, behaviorHints: { notWebReady: false, filename },
         });
       } else {
         streams.push({ name: '🇹🇷 DiziPal (İndir)', title: `⬇️ ${title}`, externalUrl: ep.link });
@@ -334,10 +311,8 @@ app.get('/stream/series/:id.json', async (req, res) => {
       streams.push({ name: '🇹🇷 DiziPal', title: `▶️ ${title}`, externalUrl: ep.link });
     } else {
       streams.push({
-        name: '🇹🇷 DiziPal',
-        title: `🎬 ${title} — Türkçe Dublaj`,
-        url: ep.link,
-        behaviorHints: { notWebReady: false, filename },
+        name: '🇹🇷 DiziPal', title: `🎬 ${title} — Türkçe Dublaj`,
+        url: ep.link, behaviorHints: { notWebReady: false, filename },
       });
     }
 
@@ -349,16 +324,9 @@ app.get('/stream/series/:id.json', async (req, res) => {
 });
 
 app.get('/status', (req, res) => {
-  res.json({
-    status: 'ok',
-    series_cached: allSeriesCache ? allSeriesCache.list.length : 0,
-    fetch_in_progress: fetchInProgress,
-    cache_keys: cache.keys().length,
-  });
+  res.json({ status: 'ok', cache_keys: cache.keys().length });
 });
 
 app.listen(PORT, () => {
-  console.log(`🇹🇷 DiziPal Orijinal v4 — Port ${PORT}`);
-  // Arka planda hemen başlat
-  getAllSeries().catch(e => console.error('[Startup Hata]', e.message));
+  console.log(`🇹🇷 DiziPal Orijinal v5 — Port ${PORT}`);
 });
