@@ -1,0 +1,13 @@
+{
+  "name": "dizipalorijinal-addon",
+  "version": "1.0.0",
+  "description": "DiziPal Orijinal - Türkçe Dublaj Dizi Eklentisi",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-cache": "^5.1.2"
+  }
+}
